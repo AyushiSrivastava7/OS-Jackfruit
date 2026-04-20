@@ -14,6 +14,7 @@
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/timer.h>
+#include <linux/interrupt.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
