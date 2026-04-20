@@ -48,6 +48,9 @@
 #define DEFAULT_SOFT_LIMIT (40UL << 20)
 #define DEFAULT_HARD_LIMIT (64UL << 20)
 
+
+
+
 typedef enum {
     CMD_SUPERVISOR = 0,
     CMD_START,
@@ -289,9 +292,24 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+    }
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
 }
 
 /*
@@ -305,9 +323,24 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == 0 && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+    }
+
+    if (buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    *item = buffer->items[buffer->head];
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
 }
 
 /*
@@ -321,10 +354,26 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+    log_item_t item;
+
+    while (1) {
+        if (bounded_buffer_pop(&ctx->log_buffer, &item) != 0)
+            break;
+
+        // Open log file
+        int fd = open(item.container_id, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) {
+            perror("open log file");
+            continue;
+        }
+
+        write(fd, item.data, item.length);
+        close(fd);
+    }
+
     return NULL;
 }
-
 /*
  * TODO:
  * Implement the clone child entrypoint.
@@ -338,7 +387,44 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *config = (child_config_t *)arg;
+
+    // Set hostname
+    if (sethostname(config->id, strlen(config->id)) < 0) {
+        perror("sethostname");
+        return 1;
+    }
+
+    // Change root
+    if (chroot(config->rootfs) < 0) {
+        perror("chroot");
+        return 1;
+    }
+
+    if (chdir("/") < 0) {
+        perror("chdir");
+        return 1;
+    }
+
+    // Mount proc (optional but recommended)
+    mkdir("/proc", 0555);
+    if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
+        perror("mount /proc");
+    }
+
+    // Redirect logs
+    if (dup2(config->log_write_fd, STDOUT_FILENO) < 0 ||
+        dup2(config->log_write_fd, STDERR_FILENO) < 0) {
+        perror("dup2");
+        return 1;
+    }
+
+    close(config->log_write_fd);
+
+    // Execute command
+    execl("/bin/sh", "sh", "-c", config->command, NULL);
+
+    perror("execl");
     return 1;
 }
 
@@ -410,6 +496,16 @@ static int run_supervisor(const char *rootfs)
         pthread_mutex_destroy(&ctx.metadata_lock);
         return 1;
     }
+
+    rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
+    if (rc != 0) {
+        errno = rc;
+        perror("pthread_create");
+        return 1;
+    }
+
+printf("Supervisor initialized (basic mode)\n");
+pause();  // TEMP: keeps process alive
 
     /*
      * TODO:
