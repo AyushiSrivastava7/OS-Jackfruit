@@ -381,6 +381,10 @@ void *logging_thread(void *arg)
         int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
             write(fd, item.data, item.length);
+            ssize_t written = write(fd, item.data, item.length);
+            if (written == -1) {
+                perror("write failed");
+            }
             close(fd);
         }
     }
