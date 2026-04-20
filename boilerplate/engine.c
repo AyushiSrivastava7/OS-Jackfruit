@@ -1,5 +1,4 @@
-// engine_full_fixed.c
-
+```c
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -16,6 +15,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -28,10 +28,7 @@
 
 typedef enum {
     CMD_START = 1,
-    CMD_RUN,
-    CMD_PS,
-    CMD_LOGS,
-    CMD_STOP
+    CMD_RUN
 } command_kind_t;
 
 typedef enum {
@@ -174,20 +171,32 @@ int child_fn(void *arg)
 {
     child_cfg_t *cfg = arg;
 
-    sethostname(cfg->id, strlen(cfg->id));
+    if (sethostname(cfg->id, strlen(cfg->id)) != 0) {
+        perror("sethostname");
+        return 1;
+    }
 
     if (chroot(cfg->rootfs) < 0) {
         perror("chroot");
         return 1;
     }
 
-    chdir("/");
+    if (chdir("/") != 0) {
+        perror("chdir");
+        return 1;
+    }
 
     mkdir("/proc", 0555);
-    mount("proc", "/proc", "proc", 0, NULL);
+    if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
+        perror("mount proc");
+    }
 
-    dup2(cfg->logfd, STDOUT_FILENO);
-    dup2(cfg->logfd, STDERR_FILENO);
+    if (dup2(cfg->logfd, STDOUT_FILENO) < 0 ||
+        dup2(cfg->logfd, STDERR_FILENO) < 0) {
+        perror("dup2");
+        return 1;
+    }
+
     close(cfg->logfd);
 
     execl("/bin/sh", "sh", "-c", cfg->command, NULL);
@@ -209,12 +218,31 @@ void handle_start(ctx_t *ctx, request_t *req, response_t *res)
     }
 
     child_cfg_t *cfg = malloc(sizeof(*cfg));
-    strcpy(cfg->id, req->id);
-    strcpy(cfg->rootfs, req->rootfs);
-    strcpy(cfg->command, req->command);
+    if (!cfg) {
+        perror("malloc");
+        res->status = 1;
+        return;
+    }
+
+    strncpy(cfg->id, req->id, CONTAINER_ID_LEN - 1);
+    cfg->id[CONTAINER_ID_LEN - 1] = '\0';
+
+    strncpy(cfg->rootfs, req->rootfs, PATH_MAX - 1);
+    cfg->rootfs[PATH_MAX - 1] = '\0';
+
+    strncpy(cfg->command, req->command, sizeof(cfg->command) - 1);
+    cfg->command[sizeof(cfg->command) - 1] = '\0';
+
     cfg->logfd = pipefd[1];
 
-    void *stack = malloc(STACK_SIZE);
+    void *stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (stack == MAP_FAILED) {
+        perror("mmap");
+        res->status = 1;
+        return;
+    }
 
     pid_t pid = clone(child_fn, stack + STACK_SIZE,
                       CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
@@ -224,19 +252,22 @@ void handle_start(ctx_t *ctx, request_t *req, response_t *res)
 
     if (pid < 0) {
         perror("clone");
+        close(pipefd[0]);
+        free(cfg);
         res->status = 1;
         return;
     }
 
-    // log reader
     if (fork() == 0) {
         while (1) {
             log_item_t item;
             ssize_t n = read(pipefd[0], item.data, LOG_CHUNK_SIZE);
             if (n <= 0) break;
 
-            strcpy(item.container_id, req->id);
+            strncpy(item.container_id, req->id, CONTAINER_ID_LEN - 1);
+            item.container_id[CONTAINER_ID_LEN - 1] = '\0';
             item.length = n;
+
             buffer_push(&ctx->buffer, &item);
         }
         close(pipefd[0]);
@@ -246,7 +277,8 @@ void handle_start(ctx_t *ctx, request_t *req, response_t *res)
     pthread_mutex_lock(&ctx->lock);
 
     container_record_t *rec = malloc(sizeof(*rec));
-    strcpy(rec->id, req->id);
+    strncpy(rec->id, req->id, CONTAINER_ID_LEN - 1);
+    rec->id[CONTAINER_ID_LEN - 1] = '\0';
     rec->pid = pid;
     rec->state = CONTAINER_RUNNING;
     rec->next = ctx->list;
@@ -289,6 +321,8 @@ int run_supervisor()
     printf("Supervisor running...\n");
 
     while (1) {
+        while (waitpid(-1, NULL, WNOHANG) > 0);
+
         int cfd = accept(ctx.server_fd, NULL, NULL);
         if (cfd < 0) continue;
 
@@ -335,8 +369,7 @@ int send_req(request_t *req)
         return 1;
     }
 
-    if (write(fd, req, sizeof(*req)) != sizeof(*req))
-        perror("write");
+    write(fd, req, sizeof(*req));
 
     response_t res;
     if (read(fd, &res, sizeof(res)) == sizeof(res))
@@ -362,10 +395,11 @@ int main(int argc, char *argv[])
     if (!strcmp(argv[1], "start") || !strcmp(argv[1], "run")) {
         if (argc < 5) return 1;
         req.kind = CMD_START;
-        strcpy(req.id, argv[2]);
-        strcpy(req.rootfs, argv[3]);
-        strcpy(req.command, argv[4]);
+        strncpy(req.id, argv[2], CONTAINER_ID_LEN - 1);
+        strncpy(req.rootfs, argv[3], PATH_MAX - 1);
+        strncpy(req.command, argv[4], sizeof(req.command) - 1);
     }
 
     return send_req(&req);
 }
+```
