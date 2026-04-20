@@ -377,14 +377,28 @@ void *logging_thread(void *arg)
     char log_path[PATH_MAX];
 
     while (bounded_buffer_pop(&ctx->log_buffer, &item) == 0) {
-        snprintf(log_path, sizeof(log_path), "%s/%s.log", LOG_DIR, item.container_id);
+
+        snprintf(log_path, sizeof(log_path), "%s/%s.log",
+                 LOG_DIR, item.container_id);
+
         int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
-            write(fd, item.data, item.length);
-            ssize_t written = write(fd, item.data, item.length);
-            if (written == -1) {
-                perror("write failed");
+
+            ssize_t total = 0;
+
+            while (total < item.length) {
+                ssize_t written = write(fd,
+                                        item.data + total,
+                                        item.length - total);
+
+                if (written <= 0) {
+                    perror("write failed");
+                    break;
+                }
+
+                total += written;
             }
+
             close(fd);
         }
     }
