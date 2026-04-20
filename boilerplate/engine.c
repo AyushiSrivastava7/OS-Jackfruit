@@ -384,19 +384,22 @@ void *logging_thread(void *arg)
         int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
 
-            ssize_t total = 0;
+            size_t total = 0;
 
             while (total < item.length) {
+                size_t remaining = item.length - total;
+
                 ssize_t written = write(fd,
-                                        item.data + total,
-                                        item.length - total);
+                                         item.data + total,
+                                         remaining);
 
                 if (written <= 0) {
-                    perror("write failed");
+                    if (written < 0)
+                        perror("write failed");
                     break;
                 }
 
-                total += written;
+                total += (size_t)written;
             }
 
             close(fd);
