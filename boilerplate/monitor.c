@@ -253,7 +253,7 @@ static void __exit monitor_exit(void)
 {
     struct monitor_entry *entry, *tmp;
 
-    del_timer_sync(&monitor_timer);
+    timer_shutdown_sync(&monitor_timer);
 
     mutex_lock(&monitor_lock);
 
