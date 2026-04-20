@@ -1,4 +1,4 @@
-// engine_full.c
+// engine_full_fixed.c
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -158,7 +158,8 @@ void *logger_thread(void *arg)
 
         int fd = open(path, O_CREAT | O_WRONLY | O_APPEND, 0644);
         if (fd >= 0) {
-            write(fd, item.data, item.length);
+            if (write(fd, item.data, item.length) < 0)
+                perror("log write");
             close(fd);
         }
     }
@@ -175,7 +176,11 @@ int child_fn(void *arg)
 
     sethostname(cfg->id, strlen(cfg->id));
 
-    chroot(cfg->rootfs);
+    if (chroot(cfg->rootfs) < 0) {
+        perror("chroot");
+        return 1;
+    }
+
     chdir("/");
 
     mkdir("/proc", 0555);
@@ -191,40 +196,50 @@ int child_fn(void *arg)
 }
 
 //////////////////////////////////////////////////
-// CONTAINER START
+// START
 //////////////////////////////////////////////////
 
 void handle_start(ctx_t *ctx, request_t *req, response_t *res)
 {
     int pipefd[2];
-    pipe(pipefd);
+    if (pipe(pipefd) < 0) {
+        perror("pipe");
+        res->status = 1;
+        return;
+    }
 
-    child_cfg_t cfg;
-    strcpy(cfg.id, req->id);
-    strcpy(cfg.rootfs, req->rootfs);
-    strcpy(cfg.command, req->command);
-    cfg.logfd = pipefd[1];
+    child_cfg_t *cfg = malloc(sizeof(*cfg));
+    strcpy(cfg->id, req->id);
+    strcpy(cfg->rootfs, req->rootfs);
+    strcpy(cfg->command, req->command);
+    cfg->logfd = pipefd[1];
 
     void *stack = malloc(STACK_SIZE);
 
     pid_t pid = clone(child_fn, stack + STACK_SIZE,
                       CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
-                      &cfg);
+                      cfg);
 
     close(pipefd[1]);
 
+    if (pid < 0) {
+        perror("clone");
+        res->status = 1;
+        return;
+    }
+
     // log reader
     if (fork() == 0) {
-        close(pipefd[1]);
         while (1) {
             log_item_t item;
-            int n = read(pipefd[0], item.data, LOG_CHUNK_SIZE);
+            ssize_t n = read(pipefd[0], item.data, LOG_CHUNK_SIZE);
             if (n <= 0) break;
 
             strcpy(item.container_id, req->id);
             item.length = n;
             buffer_push(&ctx->buffer, &item);
         }
+        close(pipefd[0]);
         exit(0);
     }
 
@@ -241,53 +256,6 @@ void handle_start(ctx_t *ctx, request_t *req, response_t *res)
 
     snprintf(res->msg, sizeof(res->msg), "Started %s (pid=%d)", req->id, pid);
     res->status = 0;
-}
-
-//////////////////////////////////////////////////
-// PS
-//////////////////////////////////////////////////
-
-void handle_ps(ctx_t *ctx, response_t *res)
-{
-    pthread_mutex_lock(&ctx->lock);
-
-    container_record_t *c = ctx->list;
-    printf("Containers:\n");
-    while (c) {
-        printf("%s (pid=%d)\n", c->id, c->pid);
-        c = c->next;
-    }
-
-    pthread_mutex_unlock(&ctx->lock);
-
-    strcpy(res->msg, "Listed");
-    res->status = 0;
-}
-
-//////////////////////////////////////////////////
-// STOP
-//////////////////////////////////////////////////
-
-void handle_stop(ctx_t *ctx, request_t *req, response_t *res)
-{
-    pthread_mutex_lock(&ctx->lock);
-
-    container_record_t *c = ctx->list;
-    while (c) {
-        if (strcmp(c->id, req->id) == 0) {
-            kill(c->pid, SIGTERM);
-            c->state = CONTAINER_STOPPED;
-            snprintf(res->msg, sizeof(res->msg), "Stopped %s", req->id);
-            res->status = 0;
-            pthread_mutex_unlock(&ctx->lock);
-            return;
-        }
-        c = c->next;
-    }
-
-    pthread_mutex_unlock(&ctx->lock);
-    res->status = 1;
-    strcpy(res->msg, "Not found");
 }
 
 //////////////////////////////////////////////////
@@ -310,36 +278,42 @@ int run_supervisor()
     strcpy(addr.sun_path, CONTROL_PATH);
 
     unlink(CONTROL_PATH);
-    bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr));
+
+    if (bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+
     listen(ctx.server_fd, 10);
 
     printf("Supervisor running...\n");
 
     while (1) {
         int cfd = accept(ctx.server_fd, NULL, NULL);
+        if (cfd < 0) continue;
 
         request_t req;
         response_t res;
 
-        read(cfd, &req, sizeof(req));
+        ssize_t n = read(cfd, &req, sizeof(req));
+        if (n != sizeof(req)) {
+            close(cfd);
+            continue;
+        }
 
         switch (req.kind) {
             case CMD_START:
             case CMD_RUN:
                 handle_start(&ctx, &req, &res);
                 break;
-            case CMD_PS:
-                handle_ps(&ctx, &res);
-                break;
-            case CMD_STOP:
-                handle_stop(&ctx, &req, &res);
-                break;
             default:
                 res.status = 1;
-                strcpy(res.msg, "Unknown");
+                strcpy(res.msg, "Unsupported");
         }
 
-        write(cfd, &res, sizeof(res));
+        if (write(cfd, &res, sizeof(res)) != sizeof(res))
+            perror("write");
+
         close(cfd);
     }
 }
@@ -356,14 +330,17 @@ int send_req(request_t *req)
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, CONTROL_PATH);
 
-    connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        return 1;
+    }
 
-    write(fd, req, sizeof(*req));
+    if (write(fd, req, sizeof(*req)) != sizeof(*req))
+        perror("write");
 
     response_t res;
-    read(fd, &res, sizeof(res));
-
-    printf("%s\n", res.msg);
+    if (read(fd, &res, sizeof(res)) == sizeof(res))
+        printf("%s\n", res.msg);
 
     close(fd);
     return res.status;
@@ -382,21 +359,12 @@ int main(int argc, char *argv[])
 
     request_t req = {0};
 
-    if (!strcmp(argv[1], "start")) {
+    if (!strcmp(argv[1], "start") || !strcmp(argv[1], "run")) {
+        if (argc < 5) return 1;
         req.kind = CMD_START;
         strcpy(req.id, argv[2]);
         strcpy(req.rootfs, argv[3]);
         strcpy(req.command, argv[4]);
-    } else if (!strcmp(argv[1], "run")) {
-        req.kind = CMD_RUN;
-        strcpy(req.id, argv[2]);
-        strcpy(req.rootfs, argv[3]);
-        strcpy(req.command, argv[4]);
-    } else if (!strcmp(argv[1], "ps")) {
-        req.kind = CMD_PS;
-    } else if (!strcmp(argv[1], "stop")) {
-        req.kind = CMD_STOP;
-        strcpy(req.id, argv[2]);
     }
 
     return send_req(&req);
